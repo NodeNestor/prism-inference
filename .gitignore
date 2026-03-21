@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+*.exe
+*.obj
+*.o
+*.lib
+*.dll
+
+# Downloaded dependencies (can be re-fetched)
+vulkan_engine/deps/volk.h
+vulkan_engine/deps/volk.c
+vulkan_engine/deps/vulkan/
+
+# Temporary files
+*.zip
+glslang/
+
+# Compiled SPIR-V (regenerated from .glsl sources)
+# Actually keep these — users may not have glslangValidator
+# *.spv
+
+# Old benchmark binaries
+benchmark/build/
