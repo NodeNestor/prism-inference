@@ -9,6 +9,10 @@
  * - Only vkQueueSubmit + vkWaitForFences per frame
  *
  * This is how DLSS/FSR Neural work internally.
+ *
+ * Supports two modes:
+ * - Standalone: creates own Vulkan instance/device (for benchmarks/testing)
+ * - External: accepts external VkDevice + VkQueue (for OptiScaler integration)
  */
 
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -27,6 +31,7 @@ struct PrismVulkanConfig {
     int render_w = 960;
     int render_h = 540;
     int gpu_id = 0;
+    std::string shader_dir = "shaders/";  // path to SPIR-V shader files
 };
 
 // Push constants for each shader type
@@ -70,23 +75,50 @@ public:
     PrismVulkan() = default;
     ~PrismVulkan();
 
+    // Standalone mode: creates own Vulkan instance/device
     bool Init(const PrismVulkanConfig& config);
+
+    // External device mode: uses provided Vulkan device (for OptiScaler interop)
+    // The caller must ensure the device supports required extensions
+    bool InitWithDevice(const PrismVulkanConfig& config,
+                        VkInstance instance, VkPhysicalDevice physical,
+                        VkDevice device, VkQueue queue, uint32_t queueFamily);
+
     bool LoadWeights(const char* weights_path);
     void RecordCommandBuffer();
 
-    // Run one frame — returns GPU time in milliseconds
+    // Run one frame with CPU staging — returns GPU time in milliseconds
     float Infer(const void* input_fp16, void* output_fp16);
+
+    // Run inference reading/writing directly from/to GPU buffers (zero CPU copy)
+    // input_buf must contain 6*render_w*render_h fp16 values
+    // output_buf will receive 3*display_w*display_h fp16 values
+    // Both buffers must be on the SAME device as this engine
+    float InferGPU(VkBuffer input_buf, VkDeviceSize input_offset,
+                   VkBuffer output_buf, VkDeviceSize output_offset);
 
     // Run benchmark (N frames, returns avg ms)
     float Benchmark(int loops = 100, int warmup = 20);
 
     void Shutdown();
 
+    int GetRenderW() const { return cfg_.render_w; }
+    int GetRenderH() const { return cfg_.render_h; }
     int GetDisplayW() const { return cfg_.render_w * cfg_.scale; }
     int GetDisplayH() const { return cfg_.render_h * cfg_.scale; }
+    int GetScale() const { return cfg_.scale; }
+
+    VkDevice GetDevice() const { return device_; }
+    VkQueue GetQueue() const { return queue_; }
+    VkPhysicalDevice GetPhysicalDevice() const { return physical_; }
+    VkInstance GetInstance() const { return instance_; }
+    VkFence GetFence() const { return fence_; }
+    bool IsInitialized() const { return initialized_; }
 
 private:
     PrismVulkanConfig cfg_;
+    bool owns_device_ = false;  // true if we created the Vulkan instance/device
+    bool initialized_ = false;
 
     // Vulkan objects
     VkInstance instance_ = VK_NULL_HANDLE;
@@ -96,6 +128,7 @@ private:
     uint32_t queue_family_ = 0;
     VkCommandPool cmd_pool_ = VK_NULL_HANDLE;
     VkCommandBuffer cmd_buf_ = VK_NULL_HANDLE;
+    VkCommandBuffer cmd_buf_gpu_ = VK_NULL_HANDLE;  // separate cmd buf for GPU-to-GPU path
     VkFence fence_ = VK_NULL_HANDLE;
     VkQueryPool query_pool_ = VK_NULL_HANDLE;
     float timestamp_period_ = 0;
@@ -133,6 +166,7 @@ private:
     // Region 2: pong
 
     bool InitVulkan();
+    bool InitCommon();  // shared init after device is ready (cmd pool, fence, queries)
     bool CreatePipelines();
     bool AllocateBuffers();
     VkPipeline CreateComputePipeline(const char* spv_path, uint32_t push_size);

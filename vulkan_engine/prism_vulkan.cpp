@@ -16,13 +16,69 @@ PrismVulkan::~PrismVulkan() { Shutdown(); }
 
 bool PrismVulkan::Init(const PrismVulkanConfig& config) {
     cfg_ = config;
+    owns_device_ = true;
     if (!InitVulkan()) return false;
     if (!CreatePipelines()) return false;
     if (!AllocateBuffers()) return false;
+    initialized_ = true;
+    return true;
+}
+
+bool PrismVulkan::InitWithDevice(const PrismVulkanConfig& config,
+                                  VkInstance instance, VkPhysicalDevice physical,
+                                  VkDevice device, VkQueue queue, uint32_t queueFamily) {
+    cfg_ = config;
+    owns_device_ = false;
+    instance_ = instance;
+    physical_ = physical;
+    device_ = device;
+    queue_ = queue;
+    queue_family_ = queueFamily;
+
+    // Get timestamp period
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(physical_, &props);
+    timestamp_period_ = props.limits.timestampPeriod;
+
+    if (!InitCommon()) return false;
+    if (!CreatePipelines()) return false;
+    if (!AllocateBuffers()) return false;
+    initialized_ = true;
+    return true;
+}
+
+bool PrismVulkan::InitCommon() {
+    // Command pool
+    VkCommandPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    poolInfo.queueFamilyIndex = queue_family_;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    vkCreateCommandPool(device_, &poolInfo, nullptr, &cmd_pool_);
+
+    // Command buffers (main + GPU-to-GPU)
+    VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocInfo.commandPool = cmd_pool_;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+    vkAllocateCommandBuffers(device_, &allocInfo, &cmd_buf_);
+    vkAllocateCommandBuffers(device_, &allocInfo, &cmd_buf_gpu_);
+
+    // Fence
+    VkFenceCreateInfo fenceInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    vkCreateFence(device_, &fenceInfo, nullptr, &fence_);
+
+    // Timestamp query pool
+    VkQueryPoolCreateInfo queryInfo = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    queryInfo.queryCount = 4; // 2 for main, 2 for GPU path
+    vkCreateQueryPool(device_, &queryInfo, nullptr, &query_pool_);
+
     return true;
 }
 
 void PrismVulkan::Shutdown() {
+    if (!initialized_) return;
+    initialized_ = false;
+
     if (device_) vkDeviceWaitIdle(device_);
 
     auto destroy = [&](auto& h, auto fn) { if (h) { fn(device_, h, nullptr); h = VK_NULL_HANDLE; } };
@@ -50,8 +106,14 @@ void PrismVulkan::Shutdown() {
     destroyBuf(input_staging_, input_staging_mem_);
     destroyBuf(output_staging_, output_staging_mem_);
 
-    if (device_) { vkDestroyDevice(device_, nullptr); device_ = VK_NULL_HANDLE; }
-    if (instance_) { vkDestroyInstance(instance_, nullptr); instance_ = VK_NULL_HANDLE; }
+    // Only destroy device/instance if we created them
+    if (owns_device_) {
+        if (device_) { vkDestroyDevice(device_, nullptr); device_ = VK_NULL_HANDLE; }
+        if (instance_) { vkDestroyInstance(instance_, nullptr); instance_ = VK_NULL_HANDLE; }
+    } else {
+        device_ = VK_NULL_HANDLE;
+        instance_ = VK_NULL_HANDLE;
+    }
 }
 
 // ============================================================================
@@ -162,28 +224,7 @@ bool PrismVulkan::InitVulkan() {
     volkLoadDevice(device_);
     vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
 
-    // Command pool
-    VkCommandPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    poolInfo.queueFamilyIndex = queue_family_;
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    vkCreateCommandPool(device_, &poolInfo, nullptr, &cmd_pool_);
-
-    // Command buffer
-    VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    allocInfo.commandPool = cmd_pool_;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-    vkAllocateCommandBuffers(device_, &allocInfo, &cmd_buf_);
-
-    // Fence
-    VkFenceCreateInfo fenceInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    vkCreateFence(device_, &fenceInfo, nullptr, &fence_);
-
-    // Timestamp query pool
-    VkQueryPoolCreateInfo queryInfo = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-    queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    queryInfo.queryCount = 2;
-    vkCreateQueryPool(device_, &queryInfo, nullptr, &query_pool_);
+    if (!InitCommon()) return false;
 
     printf("Vulkan initialized\n");
     return true;
@@ -271,23 +312,25 @@ bool PrismVulkan::CreatePipelines() {
     vkCreatePipelineLayout(device_, &plInfo, nullptr, &pipeline_layout_);
 
     // Create pipelines from SPIR-V files
-    const char* shader_dir = "shaders/";
+    std::string shader_dir = cfg_.shader_dir;
+    if (!shader_dir.empty() && shader_dir.back() != '/' && shader_dir.back() != '\\')
+        shader_dir += '/';
     char path[512];
 
-    snprintf(path, sizeof(path), "%sconv3x3.spv", shader_dir);
+    snprintf(path, sizeof(path), "%sconv3x3.spv", shader_dir.c_str());
     pipe_conv3x3_ = CreateComputePipeline(path, sizeof(Conv3x3Push));
 
-    snprintf(path, sizeof(path), "%sdepthwise_conv3x3.spv", shader_dir);
+    snprintf(path, sizeof(path), "%sdepthwise_conv3x3.spv", shader_dir.c_str());
     pipe_dw_conv_ = CreateComputePipeline(path, sizeof(DWConv3x3Push));
 
-    snprintf(path, sizeof(path), "%spointwise_conv.spv", shader_dir);
+    snprintf(path, sizeof(path), "%spointwise_conv.spv", shader_dir.c_str());
     pipe_pw_conv_ = CreateComputePipeline(path, sizeof(PWConvPush));
 
-    snprintf(path, sizeof(path), "%spixelshuffle_sigmoid.spv", shader_dir);
+    snprintf(path, sizeof(path), "%spixelshuffle_sigmoid.spv", shader_dir.c_str());
     pipe_pixelshuffle_ = CreateComputePipeline(path, sizeof(PixelShufflePush));
 
     // Fused DW3x3+PW1x1 shader + tensor cores (non-tiled, best performance)
-    snprintf(path, sizeof(path), "%sfused_dw_pw.spv", shader_dir);
+    snprintf(path, sizeof(path), "%sfused_dw_pw.spv", shader_dir.c_str());
     pipe_fused_dw_pw_ = CreateComputePipeline(path, sizeof(FusedDWPWPush));
     if (pipe_fused_dw_pw_) {
         printf("  Fused DW+PW pipeline: READY (tensor cores)\n");
@@ -295,13 +338,13 @@ bool PrismVulkan::CreatePipelines() {
 
     // Input conv3x3 im2col+coopvec and output pw coopvec
     // These are stored as pipe_chw_to_hwc_ and pipe_hwc_to_chw_ (reusing slots)
-    snprintf(path, sizeof(path), "%sinput_conv_coopvec.spv", shader_dir);
+    snprintf(path, sizeof(path), "%sinput_conv_coopvec.spv", shader_dir.c_str());
     auto pipe_input_coopvec = CreateComputePipeline(path, sizeof(Conv3x3Push));
     if (pipe_input_coopvec) {
         printf("  Input conv im2col+coopvec: READY\n");
         pipe_chw_to_hwc_ = pipe_input_coopvec;  // reuse slot
     }
-    snprintf(path, sizeof(path), "%spw_conv_64to12_coopvec.spv", shader_dir);
+    snprintf(path, sizeof(path), "%spw_conv_64to12_coopvec.spv", shader_dir.c_str());
     auto pipe_output_coopvec = CreateComputePipeline(path, sizeof(PWConvPush));
     if (pipe_output_coopvec) {
         printf("  Output PW coopvec (64→12): READY\n");
@@ -309,17 +352,17 @@ bool PrismVulkan::CreatePipelines() {
     }
 
     // HWC-format shaders
-    snprintf(path, sizeof(path), "%sdepthwise_conv3x3_hwc.spv", shader_dir);
+    snprintf(path, sizeof(path), "%sdepthwise_conv3x3_hwc.spv", shader_dir.c_str());
     pipe_dw_conv_hwc_ = CreateComputePipeline(path, sizeof(DWConv3x3Push));
 
-    snprintf(path, sizeof(path), "%schw_to_hwc.spv", shader_dir);
+    snprintf(path, sizeof(path), "%schw_to_hwc.spv", shader_dir.c_str());
     pipe_chw_to_hwc_ = CreateComputePipeline(path, sizeof(ConvertPush));
 
-    snprintf(path, sizeof(path), "%shwc_to_chw.spv", shader_dir);
+    snprintf(path, sizeof(path), "%shwc_to_chw.spv", shader_dir.c_str());
     pipe_hwc_to_chw_ = CreateComputePipeline(path, sizeof(ConvertPush));
 
     // Cooperative vector (tensor core) pointwise conv — VK_NV_cooperative_vector
-    snprintf(path, sizeof(path), "%spointwise_conv_coopvec.spv", shader_dir);
+    snprintf(path, sizeof(path), "%spointwise_conv_coopvec.spv", shader_dir.c_str());
     pipe_pw_conv_coopvec_ = CreateComputePipeline(path, sizeof(PWConvPush));
     if (pipe_pw_conv_coopvec_) {
         printf("  Cooperative vector PW conv pipeline: READY (tensor cores)\n");
@@ -875,6 +918,91 @@ void PrismVulkan::RecordCommandBuffer() {
 // ============================================================================
 // Inference
 // ============================================================================
+
+float PrismVulkan::InferGPU(VkBuffer input_buf, VkDeviceSize input_offset,
+                             VkBuffer output_buf, VkDeviceSize output_offset) {
+    int W = cfg_.render_w;
+    int H = cfg_.render_h;
+    int pixels = W * H;
+    int dW = W * cfg_.scale;
+    int dH = H * cfg_.scale;
+
+    VkDeviceSize input_size = (VkDeviceSize)(6 * pixels) * 2;
+    VkDeviceSize output_size = (VkDeviceSize)(3 * dW * dH) * 2;
+
+    // Record a command buffer that copies input from shared buffer, runs inference,
+    // then copies output to shared buffer
+    vkResetCommandBuffer(cmd_buf_gpu_, 0);
+
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd_buf_gpu_, &bi);
+
+    vkCmdWriteTimestamp(cmd_buf_gpu_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, query_pool_, 2);
+
+    // Copy from shared input buffer to feature buffer (region 0)
+    VkBufferCopy copyRegion = {};
+    copyRegion.srcOffset = input_offset;
+    copyRegion.dstOffset = 0;
+    copyRegion.size = input_size;
+    vkCmdCopyBuffer(cmd_buf_gpu_, input_buf, feature_buf_, 1, &copyRegion);
+
+    // Barrier after copy before compute
+    AddBarrier(cmd_buf_gpu_);
+
+    // Now replay the pre-recorded inference dispatches
+    // We need to re-record them inline since we can't nest command buffers
+    // For now, submit the pre-recorded main cmd_buf first, then copy output
+
+    vkEndCommandBuffer(cmd_buf_gpu_);
+
+    // Submit: first copy input, then run inference, then copy output
+    // Step 1: Copy input into feature buffer
+    VkSubmitInfo si1 = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si1.commandBufferCount = 1;
+    si1.pCommandBuffers = &cmd_buf_gpu_;
+    vkQueueSubmit(queue_, 1, &si1, VK_NULL_HANDLE);
+
+    // Step 2: Submit pre-recorded inference
+    VkSubmitInfo si2 = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si2.commandBufferCount = 1;
+    si2.pCommandBuffers = &cmd_buf_;
+    vkQueueSubmit(queue_, 1, &si2, fence_);
+    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    vkResetFences(device_, 1, &fence_);
+
+    // Step 3: Copy output from feature buffer to shared output buffer
+    vkResetCommandBuffer(cmd_buf_gpu_, 0);
+    vkBeginCommandBuffer(cmd_buf_gpu_, &bi);
+
+    VkBufferCopy outCopy = {};
+    outCopy.srcOffset = 0; // output sits at start of feature buffer after pixelshuffle
+    outCopy.dstOffset = output_offset;
+    outCopy.size = output_size;
+    vkCmdCopyBuffer(cmd_buf_gpu_, feature_buf_, output_buf, 1, &outCopy);
+
+    vkCmdWriteTimestamp(cmd_buf_gpu_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, query_pool_, 3);
+    vkEndCommandBuffer(cmd_buf_gpu_);
+
+    VkSubmitInfo si3 = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si3.commandBufferCount = 1;
+    si3.pCommandBuffers = &cmd_buf_gpu_;
+    vkQueueSubmit(queue_, 1, &si3, fence_);
+    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    vkResetFences(device_, 1, &fence_);
+
+    // Read GPU timestamps
+    uint64_t timestamps[4];
+    vkGetQueryPoolResults(device_, query_pool_, 0, 4,
+                         sizeof(timestamps), timestamps, sizeof(uint64_t),
+                         VK_QUERY_RESULT_64_BIT);
+
+    // Total time including copies
+    float gpu_ms = (float)(timestamps[3] - timestamps[2]) * timestamp_period_ / 1e6f;
+    float infer_ms = (float)(timestamps[1] - timestamps[0]) * timestamp_period_ / 1e6f;
+
+    return infer_ms; // return inference time, not copy overhead
+}
 
 float PrismVulkan::Infer(const void* input_fp16, void* output_fp16) {
     int W = cfg_.render_w;
