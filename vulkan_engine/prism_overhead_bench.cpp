@@ -166,6 +166,10 @@ int main() {
     LOAD(pLinKV,   "linear_attn_kv.spv");
     LOAD(pLinRed,  "linear_attn_reduce.spv");
     LOAD(pLinQFFN, "linear_attn_qffn.spv");
+    LOAD(pFFNSplit,"bench_ffn_split.spv");
+    LOAD(pFFNcv256,"bench_ffn_cv256.spv");
+    LOAD(pFFNW1,   "bench_ffn_w1only.spv");
+    LOAD(pFFNW2,   "bench_ffn_w2only.spv");
     #undef LOAD
 
     // Constants
@@ -304,6 +308,57 @@ int main() {
         addBarrier(c); addBarrier(c); addBarrier(c); addBarrier(c);
     });
 
+    // Test: FFN split into 4x coopvec<128>
+    double t_ffnsplit = bench("FFN split 4x cv128 (32 WGs)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+        if (!pFFNSplit) return;
+        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pFFNSplit);
+        int32_t pc[] = {n_tokens, dim, ffn_w1, ffn_b1, ffn_w2, ffn_b2, f_in, f_out};
+        vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+        vkCmdDispatch(c, n_wg32, 1, 1);
+    });
+
+    // Test: FFN with 2x coopvec<256>
+    double t_ffncv256 = bench("FFN 2x cv256 (32 WGs)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+        if (!pFFNcv256) return;
+        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pFFNcv256);
+        int32_t pc[] = {n_tokens, dim, ffn_w1, ffn_b1, ffn_w2, ffn_b2, f_in, f_out};
+        vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+        vkCmdDispatch(c, n_wg32, 1, 1);
+    });
+
+    // Test: FFN W1 only (isolate W1 vs W2)
+    int f_hidden512 = f_out + n_tokens * 128;  // temp for 512-dim hidden
+    bench("FFN W1-only 128->512 (32 WGs)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+        if (!pFFNW1) return;
+        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pFFNW1);
+        int32_t pc[] = {n_tokens, dim, 512, ffn_w1, ffn_b1, f_in, f_hidden512};
+        vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+        vkCmdDispatch(c, n_wg32, 1, 1);
+    });
+
+    // Test: FFN W2 only
+    bench("FFN W2-only 512->128 (32 WGs)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+        if (!pFFNW2) return;
+        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pFFNW2);
+        int32_t pc[] = {n_tokens, dim, 512, ffn_w2, ffn_b2, f_hidden512, f_in, f_out};
+        vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+        vkCmdDispatch(c, n_wg32, 1, 1);
+    });
+
+    // Test: FFN 2-dispatch (W1 + W2 with barrier)
+    bench("FFN 2-dispatch W1+W2 (32 WGs each)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+        if (!pFFNW1 || !pFFNW2) return;
+        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pFFNW1);
+        int32_t pc1[] = {n_tokens, dim, 512, ffn_w1, ffn_b1, f_in, f_hidden512};
+        vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc1), pc1);
+        vkCmdDispatch(c, n_wg32, 1, 1);
+        addBarrier(c);
+        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pFFNW2);
+        int32_t pc2[] = {n_tokens, dim, 512, ffn_w2, ffn_b2, f_hidden512, f_in, f_out};
+        vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc2), pc2);
+        vkCmdDispatch(c, n_wg32, 1, 1);
+    });
+
     printf("\n--- FULL TRANSFORMER BLOCK TESTS (4 blocks each) ---\n\n");
 
     int ws8 = 8, wx8 = (r3.w + ws8 - 1) / ws8, wy8 = (r3.h + ws8 - 1) / ws8;
@@ -430,6 +485,7 @@ int main() {
     auto dp = [&](VkPipeline p) { if (p) vkDestroyPipeline(device, p, nullptr); };
     dp(pFFN1); dp(pFFN4); dp(pWin8); dp(pQKV); dp(pAttn); dp(pOutFFN);
     dp(pWin16); dp(pLinKV); dp(pLinRed); dp(pLinQFFN);
+    dp(pFFNSplit); dp(pFFNcv256); dp(pFFNW1); dp(pFFNW2);
     vkDestroyPipelineLayout(device, pipeLayout, nullptr);
     vkDestroyDescriptorPool(device, descPool, nullptr);
     vkDestroyDescriptorSetLayout(device, descLayout, nullptr);
