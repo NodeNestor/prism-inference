@@ -491,6 +491,10 @@ int main() {
         run_e2e(8, 22);
         run_e2e(16, 8);
         run_e2e(16, 16);
+        run_e2e(16, 22);
+        run_e2e(16, 32);
+        run_e2e(4, 32);
+        run_e2e(8, 32);
 
         // Standard d256 E2E for comparison
         printf("\n  Standard d256 E2E comparison:\n");
