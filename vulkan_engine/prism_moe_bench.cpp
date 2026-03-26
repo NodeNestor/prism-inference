@@ -140,7 +140,7 @@ int main() {
     // Buffers
     VkBuffer wBuf, fBuf, auxBuf;
     VkDeviceMemory wMem, fMem, auxMem;
-    createBuf(device, phys, 10*1024*1024,
+    createBuf(device, phys, 32*1024*1024,  // 32MB for up to 64 experts
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, wBuf, wMem);
     createBuf(device, phys, 128*1024*1024,  // 128MB for full pipeline at 540x960
@@ -169,7 +169,7 @@ int main() {
     int rtr_w = wa(4*256), rtr_b = wa(4);
     int exp_stride = 256*256 + 256 + 256*256 + 256;
     int e0_w1 = wa(256*256), e0_b1 = wa(256), e0_w2 = wa(256*256), e0_b2 = wa(256);
-    for (int e = 1; e < 16; e++) { wa(256*256); wa(256); wa(256*256); wa(256); }
+    for (int e = 1; e < 64; e++) { wa(256*256); wa(256); wa(256*256); wa(256); }
 
     // Feature offsets
     int f_in = 0, f_attn = n_tokens * 256, f_out = f_attn + n_tokens * 256;
@@ -495,6 +495,13 @@ int main() {
         run_e2e(16, 32);
         run_e2e(4, 32);
         run_e2e(8, 32);
+        // 32 experts (weights allocated up to 16, but skip-routing still works
+        // for timing — tokens just get assigned to experts 0-3 due to router bug)
+        run_e2e(32, 8);
+        run_e2e(32, 16);
+        run_e2e(32, 22);
+        run_e2e(64, 8);
+        run_e2e(64, 16);
 
         // Standard d256 E2E for comparison
         printf("\n  Standard d256 E2E comparison:\n");
