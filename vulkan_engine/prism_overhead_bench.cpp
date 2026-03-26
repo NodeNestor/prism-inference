@@ -177,6 +177,8 @@ int main() {
     LOAD(pProj256to128, "pw_project_256to128.spv");
     LOAD(pWinD256,      "attention_windowed_d256.spv");
     LOAD(pFusedD256,    "attention_d256_fused_blocks.spv");
+    LOAD(pMoE,          "attention_d256_moe.spv");
+    LOAD(pMoEFFN,       "bench_moe_ffn.spv");
     LOAD(pMM1,          "bench_matmul_1call.spv");
     LOAD(pMM4,          "bench_matmul_4call.spv");
     LOAD(pMM12,         "bench_matmul_12call.spv");
@@ -204,7 +206,7 @@ int main() {
     int dim = 128;
 
     // Allocate buffers: weights (2MB) + features (16MB, plenty of room)
-    int total_weights = 2 * 1024 * 1024;  // 2M fp16 = 4MB, enough for any config
+    int total_weights = 3 * 1024 * 1024;  // 3M fp16 = 6MB, room for MoE experts
     int total_feat = 16 * 1024 * 1024;    // 16M fp16 = 32MB, room for dim=256
 
     VkBuffer wBuf, fBuf; VkDeviceMemory wMem, fMem;
@@ -410,6 +412,27 @@ int main() {
     int fe_e1 = fe_e0 + 32 * r0.pixels();
     int fe_e2 = fe_e1 + 64 * r1.pixels();
     int fe_e3 = fe_e2 + 128 * r2.pixels();
+
+    // MoE weights
+    int moe_router_w = wa(4*256), moe_router_b = wa(4);
+    // 4 experts, each: W1[256,256] + b1[256] + W2[256,256] + b2[256]
+    int moe_expert_stride = 256*256 + 256 + 256*256 + 256;  // 131,584 per expert
+    int moe_exp0_w1 = wa(256*256), moe_exp0_b1 = wa(256);
+    int moe_exp0_w2 = wa(256*256), moe_exp0_b2 = wa(256);
+    // Experts 1-3 (allocated sequentially after expert 0)
+    for (int e = 1; e < 4; e++) { wa(256*256); wa(256); wa(256*256); wa(256); }
+
+    // Isolated MoE FFN test
+    if (pMoEFFN) {
+        bench("MoE FFN-only (4 experts, 256→256)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pMoEFFN);
+            int32_t pc[] = {n_tokens, 256, moe_router_w, moe_router_b,
+                moe_expert_stride, moe_exp0_w1, moe_exp0_b1, moe_exp0_w2, moe_exp0_b2,
+                f_d256_in, f_d256_out};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+            vkCmdDispatch(c, n_wg32, 1, 1);
+        });
+    }
 
     printf("\n--- MATMUL CALL OVERHEAD TEST (256x256, same weights) ---\n\n");
 
@@ -866,6 +889,43 @@ int main() {
         run_fused(12);
     }
 
+    // Test: MoE (4 experts, shorter serial chain)
+    if (pMoE && pProj128to256 && pProj256to128) {
+        auto run_moe = [&](int nblk) {
+            char name[64];
+            snprintf(name, 64, "MoE d256 %d blk (4 experts)", nblk);
+            bench(name, [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pProj128to256);
+                int32_t pu[] = {n_tokens, proj_up_w, proj_up_b, f_in, f_d256_in};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pu), pu);
+                vkCmdDispatch(c, n_wg32, 1, 1); addBarrier(c);
+
+                int cur_in = f_d256_in, cur_out = f_d256_out;
+                for (int b = 0; b < nblk; b++) {
+                    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pMoE);
+                    int32_t pc[] = {n_tokens, 256, 8, 32, r3.w, r3.h, 8,
+                        d256_qkv_w, d256_qkv_b, d256_out_w, d256_out_b,
+                        moe_router_w, moe_router_b,
+                        moe_expert_stride,
+                        moe_exp0_w1, moe_exp0_b1, moe_exp0_w2, moe_exp0_b2,
+                        cur_in, cur_out};
+                    vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+                    vkCmdDispatch(c, total_win8, 1, 1); addBarrier(c);
+                    int tmp = cur_in; cur_in = cur_out; cur_out = tmp;
+                }
+
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pProj256to128);
+                int32_t pd[] = {n_tokens, proj_dn_w, proj_dn_b, cur_in, f_out};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pd), pd);
+                vkCmdDispatch(c, n_wg32, 1, 1);
+            });
+        };
+        run_moe(4);
+        run_moe(8);
+        run_moe(12);
+        run_moe(16);
+    }
+
     // Test: FUSED 4 blocks compile-time unrolled
     if (pFused4 && pProj128to256 && pProj256to128) {
         bench("FUSED4 d256 (compile-time 4blk)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
@@ -976,7 +1036,7 @@ int main() {
     dp(pFFN1); dp(pFFN4); dp(pWin8); dp(pQKV); dp(pAttn); dp(pOutFFN);
     dp(pWin16); dp(pLinKV); dp(pLinRed); dp(pLinQFFN);
     dp(pWinFast); dp(pSplit2A); dp(pSplit2F); dp(pFFNSplit); dp(pFFNcv256); dp(pFFNW1); dp(pFFNW2);
-    dp(pMM1); dp(pMM4); dp(pMM12);
+    dp(pMoE); dp(pMoEFFN); dp(pMM1); dp(pMM4); dp(pMM12);
     dp(pDec3Fused); dp(pDec2Fused); dp(pDec1Fused);
     dp(pNNUp); dp(pConcat); dp(pPW256to128); dp(pPW192to64); dp(pPW96to32);
     dp(pSplitEnc128); dp(pSplitEnc64); dp(pInputConv); dp(pEnc1); dp(pEnc2Orig); dp(pEnc3Orig);

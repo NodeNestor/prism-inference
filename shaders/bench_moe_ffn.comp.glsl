@@ -1,0 +1,70 @@
+#version 460
+#extension GL_NV_cooperative_vector : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+
+// Isolated MoE FFN benchmark: router + 4 experts (256→256→256 each)
+// Tests if MoE works at all without the attention complexity
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    int n_tokens, dim;
+    int router_w, router_b;
+    int expert_stride;
+    int exp0_w1, exp0_b1, exp0_w2, exp0_b2;
+    int input_offset, output_offset;
+};
+
+layout(set = 0, binding = 0) readonly buffer W { float16_t weights[]; };
+layout(set = 0, binding = 1) buffer F { float16_t features[]; };
+
+void main() {
+    int tid = int(gl_GlobalInvocationID.x);
+    if (tid >= n_tokens) return;
+
+    coopvecNV<float16_t, 256> inp;
+    coopVecLoadNV(inp, features, (input_offset + tid * dim) * 2);
+
+    // Router: 256→4
+    coopvecNV<float16_t, 4> logits;
+    coopVecMatMulAddNV(logits, inp, gl_ComponentTypeFloat16NV,
+        weights, router_w * 2, gl_ComponentTypeFloat16NV,
+        weights, router_b * 2, gl_ComponentTypeFloat16NV,
+        4, 256, gl_CooperativeVectorMatrixLayoutRowMajorNV, false, 256*2);
+
+    int best = 0;
+    float best_val = float(logits[0]);
+    for (int e = 1; e < 4; e++) {
+        float v = float(logits[e]);
+        if (v > best_val) { best_val = v; best = e; }
+    }
+
+    // All 4 experts, masked selection
+    coopvecNV<float16_t, 256> result = coopvecNV<float16_t, 256>(float16_t(0.0));
+
+    for (int e = 0; e < 4; e++) {
+        int eoff = e * expert_stride;
+        coopvecNV<float16_t, 256> h;
+        coopVecMatMulAddNV(h, inp, gl_ComponentTypeFloat16NV,
+            weights, (exp0_w1 + eoff) * 2, gl_ComponentTypeFloat16NV,
+            weights, (exp0_b1 + eoff) * 2, gl_ComponentTypeFloat16NV,
+            256, 256, gl_CooperativeVectorMatrixLayoutRowMajorNV, false, 256*2);
+        for (int i = 0; i < 256; i++) {
+            float x = float(h[i]);
+            h[i] = float16_t(max(x, 0.0));  // ReLU for simplicity
+        }
+        coopvecNV<float16_t, 256> eo;
+        coopVecMatMulAddNV(eo, h, gl_ComponentTypeFloat16NV,
+            weights, (exp0_w2 + eoff) * 2, gl_ComponentTypeFloat16NV,
+            weights, (exp0_b2 + eoff) * 2, gl_ComponentTypeFloat16NV,
+            256, 256, gl_CooperativeVectorMatrixLayoutRowMajorNV, false, 256*2);
+
+        float mask = (e == best) ? 1.0 : 0.0;
+        for (int i = 0; i < 256; i++)
+            result[i] = float16_t(float(result[i]) + float(eo[i]) * mask);
+    }
+
+    for (int i = 0; i < 256; i++) result[i] = result[i] + inp[i];
+    coopVecStoreNV(result, features, (output_offset + tid * dim) * 2);
+}
