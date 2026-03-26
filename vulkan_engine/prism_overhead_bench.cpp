@@ -179,6 +179,11 @@ int main() {
     LOAD(pFusedD256,    "attention_d256_fused_blocks.spv");
     LOAD(pMoE,          "attention_d256_moe.spv");
     LOAD(pMoEFFN,       "bench_moe_ffn.spv");
+    LOAD(pAttnD256,     "split2_qkv_attn_d256.spv");
+    LOAD(pMoE2,         "moe_ffn_2exp.spv");
+    LOAD(pMoE4,         "moe_ffn_4exp.spv");
+    LOAD(pMoE8,         "moe_ffn_8exp.spv");
+    LOAD(pMoE16,        "moe_ffn_16exp.spv");
     LOAD(pMM1,          "bench_matmul_1call.spv");
     LOAD(pMM4,          "bench_matmul_4call.spv");
     LOAD(pMM12,         "bench_matmul_12call.spv");
@@ -206,8 +211,8 @@ int main() {
     int dim = 128;
 
     // Allocate buffers: weights (2MB) + features (16MB, plenty of room)
-    int total_weights = 3 * 1024 * 1024;  // 3M fp16 = 6MB, room for MoE experts
-    int total_feat = 16 * 1024 * 1024;    // 16M fp16 = 32MB, room for dim=256
+    int total_weights = 5 * 1024 * 1024;  // 5M fp16 = 10MB, room for 16 MoE experts
+    int total_feat = 24 * 1024 * 1024;    // 24M fp16 = 48MB, room for MoE pipeline
 
     VkBuffer wBuf, fBuf; VkDeviceMemory wMem, fMem;
     createBuf(device, phys, (VkDeviceSize)total_weights * 2,
@@ -421,6 +426,32 @@ int main() {
     int moe_exp0_w2 = wa(256*256), moe_exp0_b2 = wa(256);
     // Experts 1-3 (allocated sequentially after expert 0)
     for (int e = 1; e < 4; e++) { wa(256*256); wa(256); wa(256*256); wa(256); }
+
+    // MoE router for 16 experts (max)
+    int moe16_router_w = wa(16*256), moe16_router_b = wa(16);
+    // 16 experts
+    int moe16_exp0_w1 = wa(256*256), moe16_exp0_b1 = wa(256);
+    int moe16_exp0_w2 = wa(256*256), moe16_exp0_b2 = wa(256);
+    for (int e = 1; e < 16; e++) { wa(256*256); wa(256); wa(256*256); wa(256); }
+
+    // Isolated MoE FFN tests (different expert counts)
+    printf("\n--- MoE FFN SCALING (isolated, dim=256) ---\n\n");
+
+    auto bench_moe_ffn = [&](const char* name, VkPipeline pipe, int n_exp, int rw, int rb) {
+        if (!pipe) return;
+        bench(name, [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+            int32_t pc[] = {n_tokens, 256, rw, rb,
+                moe_expert_stride, moe16_exp0_w1, moe16_exp0_b1, moe16_exp0_w2, moe16_exp0_b2,
+                f_d256_in, f_d256_out};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+            vkCmdDispatch(c, n_wg32, 1, 1);
+        });
+    };
+    bench_moe_ffn("MoE 2 experts (256→256→256)", pMoE2, 2, moe16_router_w, moe16_router_b);
+    bench_moe_ffn("MoE 4 experts (256→256→256)", pMoE4, 4, moe16_router_w, moe16_router_b);
+    bench_moe_ffn("MoE 8 experts (256→256→256)", pMoE8, 8, moe16_router_w, moe16_router_b);
+    bench_moe_ffn("MoE 16 experts (256→256→256)", pMoE16, 16, moe16_router_w, moe16_router_b);
 
     // Isolated MoE FFN test
     if (pMoEFFN) {
@@ -889,6 +920,53 @@ int main() {
         run_fused(12);
     }
 
+    // Full 2-split MoE pipeline
+    printf("\n--- 2-SPLIT MoE PIPELINE (attn + MoE FFN per block) ---\n\n");
+    {
+        auto run_moe_pipeline = [&](int nblk, VkPipeline moe_pipe, int n_exp) {
+            if (!pAttnD256 || !moe_pipe || !pProj128to256 || !pProj256to128) return;
+            char name[80];
+            snprintf(name, 80, "MoE %dexp x %dblk (2-split d256)", n_exp, nblk);
+            bench(name, [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pProj128to256);
+                int32_t pu[] = {n_tokens, proj_up_w, proj_up_b, f_in, f_d256_in};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pu), pu);
+                vkCmdDispatch(c, n_wg32, 1, 1); addBarrier(c);
+
+                int cur_in = f_d256_in, cur_out = f_d256_out;
+                for (int b = 0; b < nblk; b++) {
+                    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pAttnD256);
+                    int32_t pa[] = {n_tokens, 256, 8, 32, r3.w, r3.h, 8,
+                        d256_qkv_w, d256_qkv_b, d256_out_w, d256_out_b,
+                        cur_in, f_d256_ping};
+                    vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pa), pa);
+                    vkCmdDispatch(c, total_win8, 1, 1); addBarrier(c);
+
+                    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, moe_pipe);
+                    int32_t pm[] = {n_tokens, 256, moe16_router_w, moe16_router_b,
+                        moe_expert_stride, moe16_exp0_w1, moe16_exp0_b1, moe16_exp0_w2, moe16_exp0_b2,
+                        f_d256_ping, cur_out};
+                    vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pm), pm);
+                    vkCmdDispatch(c, n_wg32, 1, 1); addBarrier(c);
+
+                    int tmp = cur_in; cur_in = cur_out; cur_out = tmp;
+                }
+
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pProj256to128);
+                int32_t pd[] = {n_tokens, proj_dn_w, proj_dn_b, cur_in, f_out};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pd), pd);
+                vkCmdDispatch(c, n_wg32, 1, 1);
+            });
+        };
+        run_moe_pipeline(4, pMoE4, 4);
+        run_moe_pipeline(8, pMoE4, 4);
+        run_moe_pipeline(12, pMoE4, 4);
+        run_moe_pipeline(4, pMoE8, 8);
+        run_moe_pipeline(8, pMoE8, 8);
+        run_moe_pipeline(4, pMoE16, 16);
+        run_moe_pipeline(8, pMoE16, 16);
+    }
+
     // Test: MoE (4 experts, shorter serial chain)
     if (pMoE && pProj128to256 && pProj256to128) {
         auto run_moe = [&](int nblk) {
@@ -1036,7 +1114,7 @@ int main() {
     dp(pFFN1); dp(pFFN4); dp(pWin8); dp(pQKV); dp(pAttn); dp(pOutFFN);
     dp(pWin16); dp(pLinKV); dp(pLinRed); dp(pLinQFFN);
     dp(pWinFast); dp(pSplit2A); dp(pSplit2F); dp(pFFNSplit); dp(pFFNcv256); dp(pFFNW1); dp(pFFNW2);
-    dp(pMoE); dp(pMoEFFN); dp(pMM1); dp(pMM4); dp(pMM12);
+    dp(pMoE); dp(pMoEFFN); dp(pAttnD256); dp(pMoE2); dp(pMoE4); dp(pMoE8); dp(pMoE16); dp(pMM1); dp(pMM4); dp(pMM12);
     dp(pDec3Fused); dp(pDec2Fused); dp(pDec1Fused);
     dp(pNNUp); dp(pConcat); dp(pPW256to128); dp(pPW192to64); dp(pPW96to32);
     dp(pSplitEnc128); dp(pSplitEnc64); dp(pInputConv); dp(pEnc1); dp(pEnc2Orig); dp(pEnc3Orig);
