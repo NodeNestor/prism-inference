@@ -177,6 +177,9 @@ int main() {
     LOAD(pProj256to128, "pw_project_256to128.spv");
     LOAD(pWinD256,      "attention_windowed_d256.spv");
     LOAD(pFusedD256,    "attention_d256_fused_blocks.spv");
+    LOAD(pMM1,          "bench_matmul_1call.spv");
+    LOAD(pMM4,          "bench_matmul_4call.spv");
+    LOAD(pMM12,         "bench_matmul_12call.spv");
     LOAD(pDec3Fused,    "dec3_fused.spv");
     LOAD(pDec2Fused,    "dec2_fused.spv");
     LOAD(pDec1Fused,    "dec1_fused.spv");
@@ -407,6 +410,33 @@ int main() {
     int fe_e1 = fe_e0 + 32 * r0.pixels();
     int fe_e2 = fe_e1 + 64 * r1.pixels();
     int fe_e3 = fe_e2 + 128 * r2.pixels();
+
+    printf("\n--- MATMUL CALL OVERHEAD TEST (256x256, same weights) ---\n\n");
+
+    // d256 feature offsets for matmul tests
+    int mm_in = f_d256_in, mm_out = f_d256_out;
+
+    if (pMM1) bench("1x matmul 256x256 (32 WGs)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pMM1);
+        int32_t pc[] = {n_tokens, d256_qkv_w, d256_qkv_b, mm_in, mm_out};
+        vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+        vkCmdDispatch(c, n_wg32, 1, 1);
+    });
+    if (pMM4) bench("4x matmul 256x256 (32 WGs)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pMM4);
+        int32_t pc[] = {n_tokens, d256_qkv_w, d256_qkv_b, mm_in, mm_out};
+        vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+        vkCmdDispatch(c, n_wg32, 1, 1);
+    });
+    if (pMM12) bench("12x matmul 256x256 (32 WGs)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pMM12);
+        int32_t pc[] = {n_tokens, d256_qkv_w, d256_qkv_b, mm_in, mm_out};
+        vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+        vkCmdDispatch(c, n_wg32, 1, 1);
+    });
+
+    printf("\n  If time scales linearly with call count → per-call overhead dominates\n");
+    printf("  If time barely increases → compute/bandwidth dominates\n\n");
 
     printf("\n--- ENCODER TESTS ---\n\n");
 
@@ -946,6 +976,7 @@ int main() {
     dp(pFFN1); dp(pFFN4); dp(pWin8); dp(pQKV); dp(pAttn); dp(pOutFFN);
     dp(pWin16); dp(pLinKV); dp(pLinRed); dp(pLinQFFN);
     dp(pWinFast); dp(pSplit2A); dp(pSplit2F); dp(pFFNSplit); dp(pFFNcv256); dp(pFFNW1); dp(pFFNW2);
+    dp(pMM1); dp(pMM4); dp(pMM12);
     dp(pDec3Fused); dp(pDec2Fused); dp(pDec1Fused);
     dp(pNNUp); dp(pConcat); dp(pPW256to128); dp(pPW192to64); dp(pPW96to32);
     dp(pSplitEnc128); dp(pSplitEnc64); dp(pInputConv); dp(pEnc1); dp(pEnc2Orig); dp(pEnc3Orig);
