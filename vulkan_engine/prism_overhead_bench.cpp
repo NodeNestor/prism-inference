@@ -177,6 +177,14 @@ int main() {
     LOAD(pProj256to128, "pw_project_256to128.spv");
     LOAD(pWinD256,      "attention_windowed_d256.spv");
     LOAD(pFusedD256,    "attention_d256_fused_blocks.spv");
+    LOAD(pDec3Fused,    "dec3_fused.spv");
+    LOAD(pDec2Fused,    "dec2_fused.spv");
+    LOAD(pDec1Fused,    "dec1_fused.spv");
+    LOAD(pNNUp,         "nn_upsample.spv");
+    LOAD(pConcat,       "concat_skip.spv");
+    LOAD(pPW256to128,   "pw_conv_coopvec_256to128.spv");
+    LOAD(pPW192to64,    "pw_conv_coopvec_192to64.spv");
+    LOAD(pPW96to32,     "pw_conv_coopvec_96to32.spv");
     LOAD(pSplitEnc128,  "strided_conv_split_128ch.spv");
     LOAD(pSplitEnc64,   "strided_conv_split_64ch.spv");
     LOAD(pInputConv,    "conv3x3_coopvec_9ch.spv");
@@ -485,6 +493,104 @@ int main() {
             int32_t p[] = {64, 128, r1.w, r1.h, r2.w, r2.h, enc2_w, enc2_b, fe_e1, fe_e2};
             vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), p);
             vkCmdDispatch(c, (r2.pixels()+255)/256, 1, 1);
+        });
+    }
+
+    // Decoder weights
+    int dec3_pw_w = wa(128*256), dec3_pw_b = wa(128);
+    int dec2_pw_w = wa(64*192), dec2_pw_b = wa(64);
+    int dec1_pw_w = wa(32*96), dec1_pw_b = wa(32);
+
+    // Decoder feature offsets (reuse encoder features as skip connections)
+    // dec3: reads transformer output (fe_e3, 128ch@r3), skip from enc2 (fe_e2, 128ch@r2)
+    int fd_d3_up = fe_e3 + 128 * r3.pixels();
+    int fd_d3_cat = fd_d3_up + 128 * r2.pixels();
+    int fd_d3_out = fd_d3_cat + 256 * r2.pixels();
+    int fd_d2_up = fd_d3_out + 128 * r2.pixels();
+    int fd_d2_cat = fd_d2_up + 128 * r1.pixels();
+    int fd_d2_out = fd_d2_cat + 192 * r1.pixels();
+    int fd_d1_up = fd_d2_out + 64 * r1.pixels();
+    int fd_d1_cat = fd_d1_up + 64 * r0.pixels();
+    int fd_d1_out = fd_d1_cat + 96 * r0.pixels();
+
+    printf("\n--- DECODER TESTS ---\n\n");
+
+    // Original decoder (3 dispatches per stage = 9 total)
+    if (pNNUp && pConcat && pPW256to128 && pPW192to64 && pPW96to32) {
+        bench("Decoder ORIGINAL (9 dispatches)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+            // dec3: up + cat + pw
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pNNUp);
+            int32_t u3[] = {128, r3.w, r3.h, r2.w, r2.h, fe_e3, fd_d3_up};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(u3), u3);
+            vkCmdDispatch(c, (128*r3.pixels()+255)/256, 1, 1); addBarrier(c);
+
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pConcat);
+            int32_t c3[] = {128, 128, r2.w, r2.h, fd_d3_up, fe_e2, fd_d3_cat};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(c3), c3);
+            vkCmdDispatch(c, (256*r2.pixels()+255)/256, 1, 1); addBarrier(c);
+
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pPW256to128);
+            int32_t p3[] = {256, 128, r2.w, r2.h, dec3_pw_w, dec3_pw_b, fd_d3_cat, fd_d3_out, 1};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p3), p3);
+            vkCmdDispatch(c, (r2.pixels()+255)/256, 1, 1); addBarrier(c);
+
+            // dec2
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pNNUp);
+            int32_t u2[] = {128, r2.w, r2.h, r1.w, r1.h, fd_d3_out, fd_d2_up};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(u2), u2);
+            vkCmdDispatch(c, (128*r2.pixels()+255)/256, 1, 1); addBarrier(c);
+
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pConcat);
+            int32_t c2[] = {128, 64, r1.w, r1.h, fd_d2_up, fe_e1, fd_d2_cat};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(c2), c2);
+            vkCmdDispatch(c, (192*r1.pixels()+255)/256, 1, 1); addBarrier(c);
+
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pPW192to64);
+            int32_t p2[] = {192, 64, r1.w, r1.h, dec2_pw_w, dec2_pw_b, fd_d2_cat, fd_d2_out, 1};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p2), p2);
+            vkCmdDispatch(c, (r1.pixels()+255)/256, 1, 1); addBarrier(c);
+
+            // dec1
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pNNUp);
+            int32_t u1[] = {64, r1.w, r1.h, r0.w, r0.h, fd_d2_out, fd_d1_up};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(u1), u1);
+            vkCmdDispatch(c, (64*r1.pixels()+255)/256, 1, 1); addBarrier(c);
+
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pConcat);
+            int32_t c1[] = {64, 32, r0.w, r0.h, fd_d1_up, fe_e0, fd_d1_cat};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(c1), c1);
+            vkCmdDispatch(c, (96*r0.pixels()+255)/256, 1, 1); addBarrier(c);
+
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pPW96to32);
+            int32_t p1[] = {96, 32, r0.w, r0.h, dec1_pw_w, dec1_pw_b, fd_d1_cat, fd_d1_out, 1};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p1), p1);
+            vkCmdDispatch(c, (r0.pixels()+255)/256, 1, 1);
+        });
+    }
+
+    // Fused decoder (1 dispatch per stage = 3 total)
+    if (pDec3Fused && pDec2Fused && pDec1Fused) {
+        bench("Decoder FUSED (3 dispatches)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+            // dec3 fused: up + cat + pw in one dispatch
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pDec3Fused);
+            int32_t d3[] = {r2.w, r2.h, r3.w, r3.h, 128,
+                dec3_pw_w, dec3_pw_b, fe_e3, fe_e2, fd_d3_out};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(d3), d3);
+            vkCmdDispatch(c, (r2.pixels()+255)/256, 1, 1); addBarrier(c);
+
+            // dec2 fused
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pDec2Fused);
+            int32_t d2[] = {r1.w, r1.h, r2.w, r2.h, 128, 64,
+                dec2_pw_w, dec2_pw_b, fd_d3_out, fe_e1, fd_d2_out};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(d2), d2);
+            vkCmdDispatch(c, (r1.pixels()+255)/256, 1, 1); addBarrier(c);
+
+            // dec1 fused
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pDec1Fused);
+            int32_t d1[] = {r0.w, r0.h, r1.w, r1.h, 64, 32,
+                dec1_pw_w, dec1_pw_b, fd_d2_out, fe_e0, fd_d1_out};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(d1), d1);
+            vkCmdDispatch(c, (r0.pixels()+255)/256, 1, 1);
         });
     }
 
@@ -840,6 +946,8 @@ int main() {
     dp(pFFN1); dp(pFFN4); dp(pWin8); dp(pQKV); dp(pAttn); dp(pOutFFN);
     dp(pWin16); dp(pLinKV); dp(pLinRed); dp(pLinQFFN);
     dp(pWinFast); dp(pSplit2A); dp(pSplit2F); dp(pFFNSplit); dp(pFFNcv256); dp(pFFNW1); dp(pFFNW2);
+    dp(pDec3Fused); dp(pDec2Fused); dp(pDec1Fused);
+    dp(pNNUp); dp(pConcat); dp(pPW256to128); dp(pPW192to64); dp(pPW96to32);
     dp(pSplitEnc128); dp(pSplitEnc64); dp(pInputConv); dp(pEnc1); dp(pEnc2Orig); dp(pEnc3Orig);
     dp(pProj128to256); dp(pProj256to128); dp(pWinD256); dp(pFusedD256); dp(pFused4); dp(pSharedW);
     vkDestroyPipelineLayout(device, pipeLayout, nullptr);
