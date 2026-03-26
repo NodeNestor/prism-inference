@@ -176,6 +176,7 @@ int main() {
     LOAD(pProj128to256, "pw_project_128to256.spv");
     LOAD(pProj256to128, "pw_project_256to128.spv");
     LOAD(pWinD256,      "attention_windowed_d256.spv");
+    LOAD(pFusedD256,    "attention_d256_fused_blocks.spv");
     #undef LOAD
 
     // Constants
@@ -575,6 +576,50 @@ int main() {
         });
     }
 
+    // Weight stride per block for dim=256
+    // QKV: 3*256*256 + 3*256 = 197376
+    // Out: 256*256 + 256 = 65792
+    // FFN W1: 1024*256 + 1024 = 263168
+    // FFN W2: 256*1024 + 256 = 262400
+    // Total: 788736 fp16 per block
+    int d256_block_stride = 3*256*256 + 3*256 + 256*256 + 256 + 1024*256 + 1024 + 256*1024 + 256;
+
+    // Test: FUSED multi-block dim=256 (single dispatch!)
+    if (pFusedD256 && pProj128to256 && pProj256to128) {
+        auto run_fused = [&](int nblk) {
+            char name[64];
+            snprintf(name, 64, "FUSED d256 %d blk (1 dispatch!)", nblk);
+            bench(name, [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+                // Project up
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pProj128to256);
+                int32_t pc_up[] = {n_tokens, proj_up_w, proj_up_b, f_in, f_d256_in};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_up), pc_up);
+                vkCmdDispatch(c, n_wg32, 1, 1);
+                addBarrier(c);
+
+                // ALL blocks in one dispatch
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pFusedD256);
+                int32_t pc[] = {n_tokens, 256, 8, 32, r3.w, r3.h, 8,
+                    nblk, d256_block_stride,
+                    d256_qkv_w, d256_qkv_b, d256_out_w, d256_out_b,
+                    d256_ffn_w1, d256_ffn_b1, d256_ffn_w2, d256_ffn_b2,
+                    f_d256_in, f_d256_out};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+                vkCmdDispatch(c, total_win8, 1, 1);
+                addBarrier(c);
+
+                // Project down
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pProj256to128);
+                int32_t pc_dn[] = {n_tokens, proj_dn_w, proj_dn_b, f_d256_out, f_out};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_dn), pc_dn);
+                vkCmdDispatch(c, n_wg32, 1, 1);
+            });
+        };
+        run_fused(4);
+        run_fused(8);
+        run_fused(12);
+    }
+
     // Test: 2-split (QKV+Attn | FFN-cv256) — 4 blocks
     if (pSplit2A && pSplit2F) {
         bench("2-SPLIT qkv+attn|ffn-cv256 (4 blk)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
@@ -627,7 +672,7 @@ int main() {
     dp(pFFN1); dp(pFFN4); dp(pWin8); dp(pQKV); dp(pAttn); dp(pOutFFN);
     dp(pWin16); dp(pLinKV); dp(pLinRed); dp(pLinQFFN);
     dp(pWinFast); dp(pSplit2A); dp(pSplit2F); dp(pFFNSplit); dp(pFFNcv256); dp(pFFNW1); dp(pFFNW2);
-    dp(pProj128to256); dp(pProj256to128); dp(pWinD256);
+    dp(pProj128to256); dp(pProj256to128); dp(pWinD256); dp(pFusedD256);
     vkDestroyPipelineLayout(device, pipeLayout, nullptr);
     vkDestroyDescriptorPool(device, descPool, nullptr);
     vkDestroyDescriptorSetLayout(device, descLayout, nullptr);
