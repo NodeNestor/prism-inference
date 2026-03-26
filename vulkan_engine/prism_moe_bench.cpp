@@ -169,7 +169,7 @@ int main() {
     int rtr_w = wa(4*256), rtr_b = wa(4);
     int exp_stride = 256*256 + 256 + 256*256 + 256;
     int e0_w1 = wa(256*256), e0_b1 = wa(256), e0_w2 = wa(256*256), e0_b2 = wa(256);
-    for (int e = 1; e < 4; e++) { wa(256*256); wa(256); wa(256*256); wa(256); }
+    for (int e = 1; e < 16; e++) { wa(256*256); wa(256); wa(256*256); wa(256); }
 
     // Feature offsets
     int f_in = 0, f_attn = n_tokens * 256, f_out = f_attn + n_tokens * 256;
@@ -257,10 +257,80 @@ int main() {
         });
     }
 
-    printf("\n--- Summary ---\n");
-    printf("  Standard: QKV+Attn+FFN fused in 1 dispatch/block (split cv256 FFN)\n");
-    printf("  MoE-skip: Attn + Router + 4×Expert in 6 dispatches/block\n");
-    printf("            Only ~25%% of threads do FFN per expert dispatch\n");
+    // Test scaling: more experts, more blocks
+    printf("\n--- MoE SCALING ---\n");
+    auto run_moe = [&](int n_exp, int nblk) {
+        char name[80];
+        snprintf(name, 80, "MoE %dexp x %dblk", n_exp, nblk);
+        bench(name, [&](VkCommandBuffer c, VkPipelineLayout pl) {
+            int ci = f_in, co = f_out;
+            for (int b = 0; b < nblk; b++) {
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pAttn);
+                int32_t pa[] = {n_tokens, 256, 8, 32, 120, 68, 8,
+                    qkv_w, qkv_b, out_w, out_b, ci, f_attn};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pa), pa);
+                vkCmdDispatch(c, total_win, 1, 1); addBarrier(c);
+
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pRouter);
+                int32_t pr[] = {n_tokens, 256, n_exp, rtr_w, rtr_b, f_attn, a_assign, a_count};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pr), pr);
+                vkCmdDispatch(c, n_wg, 1, 1); addBarrier(c);
+
+                for (int e = 0; e < n_exp; e++) {
+                    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pExpertSkip);
+                    int eoff = e * exp_stride;
+                    int32_t pe[] = {n_tokens, 256, e,
+                        e0_w1+eoff, e0_b1+eoff, e0_w2+eoff, e0_b2+eoff,
+                        f_attn, co, a_assign};
+                    vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pe), pe);
+                    vkCmdDispatch(c, n_wg, 1, 1); addBarrier(c);
+                }
+                int tmp=ci; ci=co; co=tmp;
+            }
+        });
+    };
+
+    // 4 experts
+    run_moe(4, 4);
+    run_moe(4, 8);
+    run_moe(4, 12);
+    run_moe(4, 16);
+    run_moe(4, 24);
+    // 8 experts (need more expert weights)
+    run_moe(8, 4);
+    run_moe(8, 8);
+    run_moe(8, 12);
+    run_moe(8, 16);
+    // 16 experts
+    run_moe(16, 4);
+    run_moe(16, 8);
+
+    // Standard d256 comparison points
+    printf("\n--- Standard d256 comparison ---\n");
+    for (int nblk : {4, 8, 12, 16, 24}) {
+        char name[80];
+        snprintf(name, 80, "Standard d256 %dblk", nblk);
+        bench(name, [&](VkCommandBuffer c, VkPipelineLayout pl) {
+            int ci = f_in, co = f_out;
+            for (int b = 0; b < nblk; b++) {
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pStdFFN);
+                int32_t pc[] = {n_tokens, 256, 8, 32, 120, 68, 8,
+                    qkv_w, qkv_b, out_w, out_b, ffn_w1, ffn_b1, ffn_w2, ffn_b2, ci, co};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+                vkCmdDispatch(c, total_win, 1, 1); addBarrier(c);
+                int tmp=ci; ci=co; co=tmp;
+            }
+        });
+    }
+
+    printf("\n--- PARAMS vs TIME COMPARISON ---\n\n");
+    printf("  Fixed cost (enc+dec+out): ~2.1ms\n");
+    printf("  60fps budget: 16.67ms - 2.1ms = 14.6ms for transformer\n\n");
+    printf("  Config                    Per-blk  @60fps-blks  FFN/blk   Total params\n");
+    printf("  Standard d256             ~0.95ms  15 blocks    525K      ~11.8M\n");
+    printf("  MoE 4exp d256             ~0.65ms  22 blocks    2.1M      ~49M\n");
+    printf("  MoE 8exp d256             ~???ms   ?? blocks    4.2M      ~???M\n");
+    printf("  MoE 16exp d256            ~???ms   ?? blocks    8.4M      ~???M\n");
 
     // Cleanup
     vkDeviceWaitIdle(device);
