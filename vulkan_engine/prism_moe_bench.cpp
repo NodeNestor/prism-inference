@@ -143,7 +143,7 @@ int main() {
     createBuf(device, phys, 10*1024*1024,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, wBuf, wMem);
-    createBuf(device, phys, 48*1024*1024,
+    createBuf(device, phys, 128*1024*1024,  // 128MB for full pipeline at 540x960
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, fBuf, fMem);
     // Aux buffer for assignments + counts (int32)
@@ -321,6 +321,232 @@ int main() {
                 int tmp=ci; ci=co; co=tmp;
             }
         });
+    }
+
+    // === END-TO-END TESTS (encoder + transformer + decoder) ===
+    printf("\n--- END-TO-END PIPELINE ---\n\n");
+
+    VkPipeline pEncIC = loadPipeline(device, pipeLayout, "shaders/conv3x3_coopvec_9ch.spv");
+    VkPipeline pEnc1 = loadPipeline(device, pipeLayout, "shaders/strided_conv_coopvec_32ch.spv");
+    VkPipeline pEnc2Split = loadPipeline(device, pipeLayout, "shaders/strided_conv_split_64ch.spv");
+    VkPipeline pEnc3Split = loadPipeline(device, pipeLayout, "shaders/strided_conv_split_128ch.spv");
+    VkPipeline pProjUp = loadPipeline(device, pipeLayout, "shaders/pw_project_128to256.spv");
+    VkPipeline pProjDn = loadPipeline(device, pipeLayout, "shaders/pw_project_256to128.spv");
+    VkPipeline pDec3 = loadPipeline(device, pipeLayout, "shaders/dec3_fused.spv");
+    VkPipeline pDec2 = loadPipeline(device, pipeLayout, "shaders/dec2_fused.spv");
+    VkPipeline pDec1 = loadPipeline(device, pipeLayout, "shaders/dec1_fused.spv");
+    VkPipeline pOut12 = loadPipeline(device, pipeLayout, "shaders/pw_conv_coopvec_32to12.spv");
+    VkPipeline pPS = loadPipeline(device, pipeLayout, "shaders/pixelshuffle_sigmoid.spv");
+
+    bool e2e_ok = pEncIC && pEnc1 && pEnc2Split && pEnc3Split && pProjUp && pProjDn &&
+                  pDec3 && pDec2 && pDec1 && pOut12 && pPS;
+    printf("  End-to-end shaders: %s\n\n", e2e_ok ? "ALL OK" : "MISSING");
+
+    if (e2e_ok) {
+        // Encoder weights
+        int enc_ic_w = wa(32*9*9), enc_ic_b = wa(32);
+        int enc1_w = wa(64*32*9), enc1_b = wa(64);
+        int enc2_w = wa(128*64*9), enc2_b = wa(128);
+        int enc3_w = wa(128*128*9), enc3_b = wa(128);
+        int proj_up_w = wa(256*128), proj_up_b = wa(256);
+        int proj_dn_w = wa(128*256), proj_dn_b = wa(128);
+        // Decoder weights
+        int d3_pw_w = wa(128*256), d3_pw_b = wa(128);
+        int d2_pw_w = wa(64*192), d2_pw_b = wa(64);
+        int d1_pw_w = wa(32*96), d1_pw_b = wa(32);
+        int out_pw_w = wa(12*32), out_pw_b = wa(12);
+
+        // Feature offsets (full pipeline)
+        struct { int w, h; } r0={960,540}, r1={480,270}, r2={240,135}, r3={120,68}, rD={1920,1080};
+        int fp = 0;
+        auto fa = [&](int ch, int w, int h) { int o = fp; fp += ch * w * h; return o; };
+        int fe_in = fa(9,r0.w,r0.h);
+        int fe_e0 = fa(32,r0.w,r0.h);
+        int fe_e1 = fa(64,r1.w,r1.h);
+        int fe_e2 = fa(128,r2.w,r2.h);
+        int fe_e3 = fa(128,r3.w,r3.h);
+        int fe_d256_in = fa(256,r3.w,r3.h);
+        int fe_d256_out = fa(256,r3.w,r3.h);
+        int fe_d256_attn = fa(256,r3.w,r3.h);
+        int fe_d3_out = fa(128,r2.w,r2.h);
+        int fe_d2_out = fa(64,r1.w,r1.h);
+        int fe_d1_out = fa(32,r0.w,r0.h);
+        int fe_out12 = fa(12,r0.w,r0.h);
+        int fe_disp = fa(3,rD.w,rD.h);
+
+        auto run_e2e = [&](int n_exp, int nblk) {
+            char name[80];
+            int ffn_per_blk = n_exp * 131584;
+            int attn_per_blk = 197376 + 65792 + n_exp * 256 + n_exp;
+            int total_trans = nblk * (attn_per_blk + ffn_per_blk);
+            int active_per_tok = nblk * (263168 + 131584);
+            snprintf(name, 80, "E2E MoE%d×%dblk (%dM tot, %dM act)",
+                n_exp, nblk, total_trans/1000000, active_per_tok/1000000);
+
+            bench(name, [&](VkCommandBuffer c, VkPipelineLayout pl) {
+                // Encoder (split)
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pEncIC);
+                int32_t p0[] = {9,32,r0.w,r0.h,enc_ic_w,enc_ic_b,fe_in,fe_e0,1};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(p0),p0);
+                vkCmdDispatch(c,(r0.w*r0.h+255)/256,1,1); addBarrier(c);
+
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pEnc1);
+                int32_t p1[] = {32,64,r0.w,r0.h,r1.w,r1.h,enc1_w,enc1_b,fe_e0,fe_e1};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(p1),p1);
+                vkCmdDispatch(c,(r1.w*r1.h+255)/256,1,1); addBarrier(c);
+
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pEnc2Split);
+                int32_t p2[] = {64,128,r1.w,r1.h,r2.w,r2.h,enc2_w,enc2_b,fe_e1,fe_e2};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(p2),p2);
+                vkCmdDispatch(c,(r2.w*r2.h+255)/256,1,1); addBarrier(c);
+
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pEnc3Split);
+                int32_t p3[] = {128,128,r2.w,r2.h,r3.w,r3.h,enc3_w,enc3_b,fe_e2,fe_e3};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(p3),p3);
+                vkCmdDispatch(c,(r3.w*r3.h+255)/256,1,1); addBarrier(c);
+
+                // Project 128→256
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pProjUp);
+                int32_t pu[] = {n_tokens, proj_up_w, proj_up_b, fe_e3, fe_d256_in};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pu),pu);
+                vkCmdDispatch(c,n_wg,1,1); addBarrier(c);
+
+                // Transformer (MoE)
+                int ci = fe_d256_in, co = fe_d256_out;
+                for (int b = 0; b < nblk; b++) {
+                    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pAttn);
+                    int32_t pa[] = {n_tokens, 256, 8, 32, 120, 68, 8,
+                        qkv_w, qkv_b, out_w, out_b, ci, fe_d256_attn};
+                    vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pa),pa);
+                    vkCmdDispatch(c, total_win, 1, 1); addBarrier(c);
+
+                    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pRouter);
+                    int32_t pr[] = {n_tokens, 256, n_exp, rtr_w, rtr_b, fe_d256_attn, a_assign, a_count};
+                    vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pr),pr);
+                    vkCmdDispatch(c, n_wg, 1, 1); addBarrier(c);
+
+                    for (int e = 0; e < n_exp; e++) {
+                        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pExpertSkip);
+                        int eoff = e * exp_stride;
+                        int32_t pe[] = {n_tokens, 256, e,
+                            e0_w1+eoff, e0_b1+eoff, e0_w2+eoff, e0_b2+eoff,
+                            fe_d256_attn, co, a_assign};
+                        vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pe),pe);
+                        vkCmdDispatch(c, n_wg, 1, 1); addBarrier(c);
+                    }
+                    int tmp=ci; ci=co; co=tmp;
+                }
+
+                // Project 256→128
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pProjDn);
+                int32_t pd[] = {n_tokens, proj_dn_w, proj_dn_b, ci, fe_e3};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pd),pd);
+                vkCmdDispatch(c,n_wg,1,1); addBarrier(c);
+
+                // Decoder (fused)
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pDec3);
+                int32_t dd3[] = {r2.w,r2.h,r3.w,r3.h,128,d3_pw_w,d3_pw_b,fe_e3,fe_e2,fe_d3_out};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(dd3),dd3);
+                vkCmdDispatch(c,(r2.w*r2.h+255)/256,1,1); addBarrier(c);
+
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pDec2);
+                int32_t dd2[] = {r1.w,r1.h,r2.w,r2.h,128,64,d2_pw_w,d2_pw_b,fe_d3_out,fe_e1,fe_d2_out};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(dd2),dd2);
+                vkCmdDispatch(c,(r1.w*r1.h+255)/256,1,1); addBarrier(c);
+
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pDec1);
+                int32_t dd1[] = {r0.w,r0.h,r1.w,r1.h,64,32,d1_pw_w,d1_pw_b,fe_d2_out,fe_e0,fe_d1_out};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(dd1),dd1);
+                vkCmdDispatch(c,(r0.w*r0.h+255)/256,1,1); addBarrier(c);
+
+                // Output
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pOut12);
+                int32_t po[] = {32,12,r0.w,r0.h,out_pw_w,out_pw_b,fe_d1_out,fe_out12,0};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(po),po);
+                vkCmdDispatch(c,(r0.w*r0.h+255)/256,1,1); addBarrier(c);
+
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pPS);
+                int32_t ps[] = {r0.w,r0.h,rD.w,rD.h,2,fe_out12,fe_disp};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(ps),ps);
+                vkCmdDispatch(c,(rD.w+15)/16,(rD.h+15)/16,1);
+            });
+        };
+
+        // How it works: each token gets routed to 1 of N experts.
+        // The router is a tiny 256→N matmul (argmax picks expert).
+        // Each expert FFN dispatch runs on ALL tokens but skips non-assigned ones.
+        // So each token only computes 1 expert FFN (256→256→256 = 131K active params).
+        // Total params = N_experts × 131K per block. Active = 131K per block.
+
+        printf("  How MoE works:\n");
+        printf("    Router: 256→N matmul picks 1 expert per token\n");
+        printf("    Each expert dispatch: runs all tokens, skips non-assigned\n");
+        printf("    Active params/token/block: 263K attn + 131K expert = 394K\n\n");
+
+        run_e2e(4, 8);
+        run_e2e(4, 16);
+        run_e2e(4, 22);
+        run_e2e(8, 8);
+        run_e2e(8, 16);
+        run_e2e(8, 22);
+        run_e2e(16, 8);
+        run_e2e(16, 16);
+
+        // Standard d256 E2E for comparison
+        printf("\n  Standard d256 E2E comparison:\n");
+        for (int nblk : {8, 12, 16}) {
+            char name[80];
+            snprintf(name, 80, "E2E Standard d256 %dblk (%dM)", nblk, nblk * 789 / 1000);
+            bench(name, [&](VkCommandBuffer c, VkPipelineLayout pl) {
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pEncIC);
+                int32_t p0[] = {9,32,r0.w,r0.h,enc_ic_w,enc_ic_b,fe_in,fe_e0,1};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(p0),p0);
+                vkCmdDispatch(c,(r0.w*r0.h+255)/256,1,1); addBarrier(c);
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pEnc1);
+                int32_t p1[] = {32,64,r0.w,r0.h,r1.w,r1.h,enc1_w,enc1_b,fe_e0,fe_e1};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(p1),p1);
+                vkCmdDispatch(c,(r1.w*r1.h+255)/256,1,1); addBarrier(c);
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pEnc2Split);
+                int32_t p2[] = {64,128,r1.w,r1.h,r2.w,r2.h,enc2_w,enc2_b,fe_e1,fe_e2};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(p2),p2);
+                vkCmdDispatch(c,(r2.w*r2.h+255)/256,1,1); addBarrier(c);
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pEnc3Split);
+                int32_t p3[] = {128,128,r2.w,r2.h,r3.w,r3.h,enc3_w,enc3_b,fe_e2,fe_e3};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(p3),p3);
+                vkCmdDispatch(c,(r3.w*r3.h+255)/256,1,1); addBarrier(c);
+
+                int ci = fe_e3, co = fe_d256_out;
+                for (int b = 0; b < nblk; b++) {
+                    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pStdFFN);
+                    int32_t pc[] = {n_tokens, 256, 8, 32, 120, 68, 8,
+                        qkv_w, qkv_b, out_w, out_b, ffn_w1, ffn_b1, ffn_w2, ffn_b2, ci, co};
+                    vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(pc),pc);
+                    vkCmdDispatch(c, total_win, 1, 1); addBarrier(c);
+                    int tmp=ci; ci=co; co=tmp;
+                }
+
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pDec3);
+                int32_t dd3[] = {r2.w,r2.h,r3.w,r3.h,128,d3_pw_w,d3_pw_b,ci,fe_e2,fe_d3_out};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(dd3),dd3);
+                vkCmdDispatch(c,(r2.w*r2.h+255)/256,1,1); addBarrier(c);
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pDec2);
+                int32_t dd2[] = {r1.w,r1.h,r2.w,r2.h,128,64,d2_pw_w,d2_pw_b,fe_d3_out,fe_e1,fe_d2_out};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(dd2),dd2);
+                vkCmdDispatch(c,(r1.w*r1.h+255)/256,1,1); addBarrier(c);
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pDec1);
+                int32_t dd1[] = {r0.w,r0.h,r1.w,r1.h,64,32,d1_pw_w,d1_pw_b,fe_d2_out,fe_e0,fe_d1_out};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(dd1),dd1);
+                vkCmdDispatch(c,(r0.w*r0.h+255)/256,1,1); addBarrier(c);
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pOut12);
+                int32_t po[] = {32,12,r0.w,r0.h,out_pw_w,out_pw_b,fe_d1_out,fe_out12,0};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(po),po);
+                vkCmdDispatch(c,(r0.w*r0.h+255)/256,1,1); addBarrier(c);
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pPS);
+                int32_t ps[] = {r0.w,r0.h,rD.w,rD.h,2,fe_out12,fe_disp};
+                vkCmdPushConstants(c,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(ps),ps);
+                vkCmdDispatch(c,(rD.w+15)/16,(rD.h+15)/16,1);
+            });
+        }
     }
 
     printf("\n--- PARAMS vs TIME COMPARISON ---\n\n");
