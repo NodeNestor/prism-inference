@@ -81,6 +81,20 @@ if(MINGW)
     target_link_options(linear_bench PRIVATE -static -static-libgcc -static-libstdc++)
 endif()
 
+# MoE benchmark (clean, isolated)
+add_executable(moe_bench prism_moe_bench.cpp deps/volk.c)
+target_include_directories(moe_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/deps)
+target_compile_definitions(moe_bench PRIVATE VK_USE_PLATFORM_WIN32_KHR VOLK_STATIC_DEFINES)
+target_link_libraries(moe_bench PRIVATE)
+if(MSVC)
+    target_compile_options(moe_bench PRIVATE /O2 /W3)
+else()
+    target_compile_options(moe_bench PRIVATE -O2 -Wall)
+endif()
+if(MINGW)
+    target_link_options(moe_bench PRIVATE -static -static-libgcc -static-libstdc++)
+endif()
+
 # Overhead analysis benchmark
 add_executable(overhead_bench
     prism_overhead_bench.cpp
