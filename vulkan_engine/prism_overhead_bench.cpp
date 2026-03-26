@@ -177,6 +177,8 @@ int main() {
     LOAD(pProj256to128, "pw_project_256to128.spv");
     LOAD(pWinD256,      "attention_windowed_d256.spv");
     LOAD(pFusedD256,    "attention_d256_fused_blocks.spv");
+    LOAD(pFused4,       "attention_d256_fused4.spv");
+    LOAD(pSharedW,      "attention_d256_shared_weights.spv");
     #undef LOAD
 
     // Constants
@@ -620,6 +622,64 @@ int main() {
         run_fused(12);
     }
 
+    // Test: FUSED 4 blocks compile-time unrolled
+    if (pFused4 && pProj128to256 && pProj256to128) {
+        bench("FUSED4 d256 (compile-time 4blk)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pProj128to256);
+            int32_t pu[] = {n_tokens, proj_up_w, proj_up_b, f_in, f_d256_in};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pu), pu);
+            vkCmdDispatch(c, n_wg32, 1, 1); addBarrier(c);
+
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pFused4);
+            int32_t pc[] = {n_tokens, 256, 8, 32, r3.w, r3.h, 8,
+                d256_block_stride,
+                d256_qkv_w, d256_qkv_b, d256_out_w, d256_out_b,
+                d256_ffn_w1, d256_ffn_b1, d256_ffn_w2, d256_ffn_b2,
+                f_d256_in, f_d256_out};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+            vkCmdDispatch(c, total_win8, 1, 1); addBarrier(c);
+
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pProj256to128);
+            int32_t pd[] = {n_tokens, proj_dn_w, proj_dn_b, f_d256_out, f_out};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pd), pd);
+            vkCmdDispatch(c, n_wg32, 1, 1);
+        });
+    }
+
+    // Test: Shared weights (ALBERT-style) — various block counts
+    if (pSharedW && pProj128to256 && pProj256to128) {
+        auto run_shared = [&](int nblk) {
+            char name[64];
+            snprintf(name, 64, "SHARED-W d256 %d blk (1 disp)", nblk);
+            bench(name, [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pProj128to256);
+                int32_t pu[] = {n_tokens, proj_up_w, proj_up_b, f_in, f_d256_in};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pu), pu);
+                vkCmdDispatch(c, n_wg32, 1, 1); addBarrier(c);
+
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pSharedW);
+                // Note: push constants match the shared weight shader layout (no weight_stride)
+                int32_t pc[] = {n_tokens, 256, 8, 32, r3.w, r3.h, 8,
+                    nblk,
+                    d256_qkv_w, d256_qkv_b, d256_out_w, d256_out_b,
+                    d256_ffn_w1, d256_ffn_b1, d256_ffn_w2, d256_ffn_b2,
+                    f_d256_in, f_d256_out};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+                vkCmdDispatch(c, total_win8, 1, 1); addBarrier(c);
+
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pProj256to128);
+                int32_t pd[] = {n_tokens, proj_dn_w, proj_dn_b, f_d256_out, f_out};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pd), pd);
+                vkCmdDispatch(c, n_wg32, 1, 1);
+            });
+        };
+        run_shared(4);
+        run_shared(8);
+        run_shared(12);
+        run_shared(16);
+        run_shared(24);
+    }
+
     // Test: 2-split (QKV+Attn | FFN-cv256) — 4 blocks
     if (pSplit2A && pSplit2F) {
         bench("2-SPLIT qkv+attn|ffn-cv256 (4 blk)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
@@ -672,7 +732,7 @@ int main() {
     dp(pFFN1); dp(pFFN4); dp(pWin8); dp(pQKV); dp(pAttn); dp(pOutFFN);
     dp(pWin16); dp(pLinKV); dp(pLinRed); dp(pLinQFFN);
     dp(pWinFast); dp(pSplit2A); dp(pSplit2F); dp(pFFNSplit); dp(pFFNcv256); dp(pFFNW1); dp(pFFNW2);
-    dp(pProj128to256); dp(pProj256to128); dp(pWinD256); dp(pFusedD256);
+    dp(pProj128to256); dp(pProj256to128); dp(pWinD256); dp(pFusedD256); dp(pFused4); dp(pSharedW);
     vkDestroyPipelineLayout(device, pipeLayout, nullptr);
     vkDestroyDescriptorPool(device, descPool, nullptr);
     vkDestroyDescriptorSetLayout(device, descLayout, nullptr);
