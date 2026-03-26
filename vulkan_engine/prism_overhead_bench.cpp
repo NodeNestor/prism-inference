@@ -166,6 +166,9 @@ int main() {
     LOAD(pLinKV,   "linear_attn_kv.spv");
     LOAD(pLinRed,  "linear_attn_reduce.spv");
     LOAD(pLinQFFN, "linear_attn_qffn.spv");
+    LOAD(pWinFast, "attention_windowed_fast.spv");
+    LOAD(pSplit2A,  "split2_qkv_attn.spv");
+    LOAD(pSplit2F,  "split2_ffn_cv256.spv");
     LOAD(pFFNSplit,"bench_ffn_split.spv");
     LOAD(pFFNcv256,"bench_ffn_cv256.spv");
     LOAD(pFFNW1,   "bench_ffn_w1only.spv");
@@ -459,6 +462,48 @@ int main() {
         });
     }
 
+    // Test: OPTIMIZED windowed 8x8 with split FFN (4 blocks)
+    if (pWinFast) {
+        bench("FAST windowed 8x8 (4 blocks)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+            int cur_in = f_in, cur_out = f_out;
+            for (int b = 0; b < 4; b++) {
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pWinFast);
+                int32_t pc[] = {n_tokens, 128, 4, 32, r3.w, r3.h, 8,
+                    qkv_w, qkv_b, out_w, out_b, ffn_w1, ffn_b1, ffn_w2, ffn_b2,
+                    cur_in, cur_out};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+                vkCmdDispatch(c, total_win8, 1, 1);
+                addBarrier(c);
+                int tmp = cur_in; cur_in = cur_out; cur_out = tmp;
+            }
+        });
+    }
+
+    // Test: 2-split (QKV+Attn | FFN-cv256) — 4 blocks
+    if (pSplit2A && pSplit2F) {
+        bench("2-SPLIT qkv+attn|ffn-cv256 (4 blk)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+            int cur_in = f_in, cur_out = f_out;
+            for (int b = 0; b < 4; b++) {
+                // Pass 1: QKV + Attention + OutProj (writes to f_attn)
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pSplit2A);
+                int32_t pc1[] = {n_tokens, 128, 4, 32, r3.w, r3.h, 8,
+                    qkv_w, qkv_b, out_w, out_b, cur_in, f_attn};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc1), pc1);
+                vkCmdDispatch(c, total_win8, 1, 1);
+                addBarrier(c);
+
+                // Pass 2: FFN with split coopvec<256> (reads f_attn, writes cur_out)
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pSplit2F);
+                int32_t pc2[] = {n_tokens, dim, ffn_w1, ffn_b1, ffn_w2, ffn_b2, f_attn, cur_out};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc2), pc2);
+                vkCmdDispatch(c, n_wg32, 1, 1);
+                addBarrier(c);
+
+                int tmp = cur_in; cur_in = cur_out; cur_out = tmp;
+            }
+        });
+    }
+
     // Summary
     printf("\n--- ANALYSIS ---\n\n");
     double theoretical = 3.3 / 380.0;  // 3.3 GFLOP / 380 TOPS = ms per block
@@ -485,7 +530,7 @@ int main() {
     auto dp = [&](VkPipeline p) { if (p) vkDestroyPipeline(device, p, nullptr); };
     dp(pFFN1); dp(pFFN4); dp(pWin8); dp(pQKV); dp(pAttn); dp(pOutFFN);
     dp(pWin16); dp(pLinKV); dp(pLinRed); dp(pLinQFFN);
-    dp(pFFNSplit); dp(pFFNcv256); dp(pFFNW1); dp(pFFNW2);
+    dp(pWinFast); dp(pSplit2A); dp(pSplit2F); dp(pFFNSplit); dp(pFFNcv256); dp(pFFNW1); dp(pFFNW2);
     vkDestroyPipelineLayout(device, pipeLayout, nullptr);
     vkDestroyDescriptorPool(device, descPool, nullptr);
     vkDestroyDescriptorSetLayout(device, descLayout, nullptr);
