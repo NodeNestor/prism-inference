@@ -173,6 +173,9 @@ int main() {
     LOAD(pFFNcv256,"bench_ffn_cv256.spv");
     LOAD(pFFNW1,   "bench_ffn_w1only.spv");
     LOAD(pFFNW2,   "bench_ffn_w2only.spv");
+    LOAD(pProj128to256, "pw_project_128to256.spv");
+    LOAD(pProj256to128, "pw_project_256to128.spv");
+    LOAD(pWinD256,      "attention_windowed_d256.spv");
     #undef LOAD
 
     // Constants
@@ -182,7 +185,7 @@ int main() {
 
     // Allocate buffers: weights (2MB) + features (16MB, plenty of room)
     int total_weights = 2 * 1024 * 1024;  // 2M fp16 = 4MB, enough for any config
-    int total_feat = 8 * 1024 * 1024;     // 8M fp16 = 16MB
+    int total_feat = 16 * 1024 * 1024;    // 16M fp16 = 32MB, room for dim=256
 
     VkBuffer wBuf, fBuf; VkDeviceMemory wMem, fMem;
     createBuf(device, phys, (VkDeviceSize)total_weights * 2,
@@ -215,6 +218,14 @@ int main() {
     int v_w = wa(128*128), v_b = wa(128);
     int q_w = wa(128*128), q_b = wa(128);
 
+    // Dim=256 weight offsets
+    int proj_up_w = wa(256*128), proj_up_b = wa(256);
+    int proj_dn_w = wa(128*256), proj_dn_b = wa(128);
+    int d256_qkv_w = wa(3*256*256), d256_qkv_b = wa(3*256);
+    int d256_out_w = wa(256*256), d256_out_b = wa(256);
+    int d256_ffn_w1 = wa(1024*256), d256_ffn_b1 = wa(1024);
+    int d256_ffn_w2 = wa(256*1024), d256_ffn_b2 = wa(256);
+
     // Feature offsets
     int f_in = 0;
     int f_out = n_tokens * 128;
@@ -226,6 +237,10 @@ int main() {
     int f_V = f_phiK + n_tokens * 128;
     int f_S = f_V + n_tokens * 128;
     int f_Z = f_S + 4 * 32 * 32;
+    // dim=256 feature space
+    int f_d256_in = f_Z + 128 + 1024;  // some padding
+    int f_d256_out = f_d256_in + n_tokens * 256;
+    int f_d256_ping = f_d256_out + n_tokens * 256;
 
     int warmup = 10, loops = 100;
 
@@ -479,6 +494,87 @@ int main() {
         });
     }
 
+    // Test: dim=256 windowed 8x8 (4 blocks, with projections)
+    if (pWinD256 && pProj128to256 && pProj256to128) {
+        bench("d256 windowed 8x8 (4 blk + proj)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+            // Project up: 128→256
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pProj128to256);
+            int32_t pc_up[] = {n_tokens, proj_up_w, proj_up_b, f_in, f_d256_in};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_up), pc_up);
+            vkCmdDispatch(c, n_wg32, 1, 1);
+            addBarrier(c);
+
+            // 4 transformer blocks at dim=256
+            int cur_in = f_d256_in, cur_out = f_d256_out;
+            for (int b = 0; b < 4; b++) {
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pWinD256);
+                int32_t pc[] = {n_tokens, 256, 8, 32, r3.w, r3.h, 8,
+                    d256_qkv_w, d256_qkv_b, d256_out_w, d256_out_b,
+                    d256_ffn_w1, d256_ffn_b1, d256_ffn_w2, d256_ffn_b2,
+                    cur_in, cur_out};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+                vkCmdDispatch(c, total_win8, 1, 1);
+                addBarrier(c);
+                int tmp = cur_in; cur_in = cur_out; cur_out = tmp;
+            }
+
+            // Project down: 256→128
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pProj256to128);
+            int32_t pc_dn[] = {n_tokens, proj_dn_w, proj_dn_b, cur_in, f_out};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_dn), pc_dn);
+            vkCmdDispatch(c, n_wg32, 1, 1);
+        });
+
+        // Also test more blocks: 8 and 12
+        bench("d256 windowed 8x8 (8 blk + proj)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pProj128to256);
+            int32_t pc_up[] = {n_tokens, proj_up_w, proj_up_b, f_in, f_d256_in};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_up), pc_up);
+            vkCmdDispatch(c, n_wg32, 1, 1); addBarrier(c);
+
+            int cur_in = f_d256_in, cur_out = f_d256_out;
+            for (int b = 0; b < 8; b++) {
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pWinD256);
+                int32_t pc[] = {n_tokens, 256, 8, 32, r3.w, r3.h, 8,
+                    d256_qkv_w, d256_qkv_b, d256_out_w, d256_out_b,
+                    d256_ffn_w1, d256_ffn_b1, d256_ffn_w2, d256_ffn_b2,
+                    cur_in, cur_out};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+                vkCmdDispatch(c, total_win8, 1, 1); addBarrier(c);
+                int tmp = cur_in; cur_in = cur_out; cur_out = tmp;
+            }
+
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pProj256to128);
+            int32_t pc_dn[] = {n_tokens, proj_dn_w, proj_dn_b, cur_in, f_out};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_dn), pc_dn);
+            vkCmdDispatch(c, n_wg32, 1, 1);
+        });
+
+        bench("d256 windowed 8x8 (12 blk + proj)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pProj128to256);
+            int32_t pc_up[] = {n_tokens, proj_up_w, proj_up_b, f_in, f_d256_in};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_up), pc_up);
+            vkCmdDispatch(c, n_wg32, 1, 1); addBarrier(c);
+
+            int cur_in = f_d256_in, cur_out = f_d256_out;
+            for (int b = 0; b < 12; b++) {
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pWinD256);
+                int32_t pc[] = {n_tokens, 256, 8, 32, r3.w, r3.h, 8,
+                    d256_qkv_w, d256_qkv_b, d256_out_w, d256_out_b,
+                    d256_ffn_w1, d256_ffn_b1, d256_ffn_w2, d256_ffn_b2,
+                    cur_in, cur_out};
+                vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+                vkCmdDispatch(c, total_win8, 1, 1); addBarrier(c);
+                int tmp = cur_in; cur_in = cur_out; cur_out = tmp;
+            }
+
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pProj256to128);
+            int32_t pc_dn[] = {n_tokens, proj_dn_w, proj_dn_b, cur_in, f_out};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_dn), pc_dn);
+            vkCmdDispatch(c, n_wg32, 1, 1);
+        });
+    }
+
     // Test: 2-split (QKV+Attn | FFN-cv256) — 4 blocks
     if (pSplit2A && pSplit2F) {
         bench("2-SPLIT qkv+attn|ffn-cv256 (4 blk)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
@@ -531,6 +627,7 @@ int main() {
     dp(pFFN1); dp(pFFN4); dp(pWin8); dp(pQKV); dp(pAttn); dp(pOutFFN);
     dp(pWin16); dp(pLinKV); dp(pLinRed); dp(pLinQFFN);
     dp(pWinFast); dp(pSplit2A); dp(pSplit2F); dp(pFFNSplit); dp(pFFNcv256); dp(pFFNW1); dp(pFFNW2);
+    dp(pProj128to256); dp(pProj256to128); dp(pWinD256);
     vkDestroyPipelineLayout(device, pipeLayout, nullptr);
     vkDestroyDescriptorPool(device, descPool, nullptr);
     vkDestroyDescriptorSetLayout(device, descLayout, nullptr);
