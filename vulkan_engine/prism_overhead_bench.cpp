@@ -177,6 +177,12 @@ int main() {
     LOAD(pProj256to128, "pw_project_256to128.spv");
     LOAD(pWinD256,      "attention_windowed_d256.spv");
     LOAD(pFusedD256,    "attention_d256_fused_blocks.spv");
+    LOAD(pSplitEnc128,  "strided_conv_split_128ch.spv");
+    LOAD(pSplitEnc64,   "strided_conv_split_64ch.spv");
+    LOAD(pInputConv,    "conv3x3_coopvec_9ch.spv");
+    LOAD(pEnc1,         "strided_conv_coopvec_32ch.spv");
+    LOAD(pEnc2Orig,     "strided_conv_coopvec_64ch.spv");
+    LOAD(pEnc3Orig,     "strided_conv_coopvec_128ch.spv");
     LOAD(pFused4,       "attention_d256_fused4.spv");
     LOAD(pSharedW,      "attention_d256_shared_weights.spv");
     #undef LOAD
@@ -379,6 +385,108 @@ int main() {
         vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc2), pc2);
         vkCmdDispatch(c, n_wg32, 1, 1);
     });
+
+    // Encoder weight offsets
+    int enc_ic_w = wa(32*9*9), enc_ic_b = wa(32);
+    int enc1_w = wa(64*32*9), enc1_b = wa(64);
+    int enc2_w = wa(128*64*9), enc2_b = wa(128);
+    int enc3_w = wa(128*128*9), enc3_b = wa(128);
+
+    // Encoder feature offsets at each resolution
+    Resolution r0 = {960, 540}, r1 = {480, 270}, r2 = {240, 135};
+    int fe_input = 0;
+    int fe_e0 = fe_input + 9 * r0.pixels();
+    int fe_e1 = fe_e0 + 32 * r0.pixels();
+    int fe_e2 = fe_e1 + 64 * r1.pixels();
+    int fe_e3 = fe_e2 + 128 * r2.pixels();
+
+    printf("\n--- ENCODER TESTS ---\n\n");
+
+    // Full encoder with ORIGINAL shaders
+    if (pInputConv && pEnc1 && pEnc2Orig && pEnc3Orig) {
+        bench("Encoder ORIGINAL (cv81+288+576+1152)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+            // input_conv 9->32 @ r0
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pInputConv);
+            int32_t p0[] = {9, 32, r0.w, r0.h, enc_ic_w, enc_ic_b, fe_input, fe_e0, 1};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p0), p0);
+            vkCmdDispatch(c, (r0.pixels()+255)/256, 1, 1); addBarrier(c);
+
+            // enc1: 32->64 stride2 @ r0->r1
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pEnc1);
+            int32_t p1[] = {32, 64, r0.w, r0.h, r1.w, r1.h, enc1_w, enc1_b, fe_e0, fe_e1};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p1), p1);
+            vkCmdDispatch(c, (r1.pixels()+255)/256, 1, 1); addBarrier(c);
+
+            // enc2: 64->128 stride2 @ r1->r2
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pEnc2Orig);
+            int32_t p2[] = {64, 128, r1.w, r1.h, r2.w, r2.h, enc2_w, enc2_b, fe_e1, fe_e2};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p2), p2);
+            vkCmdDispatch(c, (r2.pixels()+255)/256, 1, 1); addBarrier(c);
+
+            // enc3: 128->128 stride2 @ r2->r3
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pEnc3Orig);
+            int32_t p3[] = {128, 128, r2.w, r2.h, r3.w, r3.h, enc3_w, enc3_b, fe_e2, fe_e3};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p3), p3);
+            vkCmdDispatch(c, (r3.pixels()+255)/256, 1, 1);
+        });
+    }
+
+    // Full encoder with SPLIT shaders for enc2 and enc3
+    if (pInputConv && pEnc1 && pSplitEnc64 && pSplitEnc128) {
+        bench("Encoder SPLIT (cv81+288+288+288)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pInputConv);
+            int32_t p0[] = {9, 32, r0.w, r0.h, enc_ic_w, enc_ic_b, fe_input, fe_e0, 1};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p0), p0);
+            vkCmdDispatch(c, (r0.pixels()+255)/256, 1, 1); addBarrier(c);
+
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pEnc1);
+            int32_t p1[] = {32, 64, r0.w, r0.h, r1.w, r1.h, enc1_w, enc1_b, fe_e0, fe_e1};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p1), p1);
+            vkCmdDispatch(c, (r1.pixels()+255)/256, 1, 1); addBarrier(c);
+
+            // SPLIT enc2: uses split 64ch shader
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pSplitEnc64);
+            int32_t p2[] = {64, 128, r1.w, r1.h, r2.w, r2.h, enc2_w, enc2_b, fe_e1, fe_e2};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p2), p2);
+            vkCmdDispatch(c, (r2.pixels()+255)/256, 1, 1); addBarrier(c);
+
+            // SPLIT enc3: uses split 128ch shader
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pSplitEnc128);
+            int32_t p3[] = {128, 128, r2.w, r2.h, r3.w, r3.h, enc3_w, enc3_b, fe_e2, fe_e3};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p3), p3);
+            vkCmdDispatch(c, (r3.pixels()+255)/256, 1, 1);
+        });
+    }
+
+    // Isolated enc3 comparison
+    if (pEnc3Orig && pSplitEnc128) {
+        bench("enc3 ORIGINAL (cv1152)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pEnc3Orig);
+            int32_t p[] = {128, 128, r2.w, r2.h, r3.w, r3.h, enc3_w, enc3_b, fe_e2, fe_e3};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), p);
+            vkCmdDispatch(c, (r3.pixels()+255)/256, 1, 1);
+        });
+        bench("enc3 SPLIT (4x cv288)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pSplitEnc128);
+            int32_t p[] = {128, 128, r2.w, r2.h, r3.w, r3.h, enc3_w, enc3_b, fe_e2, fe_e3};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), p);
+            vkCmdDispatch(c, (r3.pixels()+255)/256, 1, 1);
+        });
+    }
+    if (pEnc2Orig && pSplitEnc64) {
+        bench("enc2 ORIGINAL (cv576)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pEnc2Orig);
+            int32_t p[] = {64, 128, r1.w, r1.h, r2.w, r2.h, enc2_w, enc2_b, fe_e1, fe_e2};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), p);
+            vkCmdDispatch(c, (r2.pixels()+255)/256, 1, 1);
+        });
+        bench("enc2 SPLIT (2x cv288)", [&](VkCommandBuffer c, VkPipelineLayout pl, auto& stamp) {
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pSplitEnc64);
+            int32_t p[] = {64, 128, r1.w, r1.h, r2.w, r2.h, enc2_w, enc2_b, fe_e1, fe_e2};
+            vkCmdPushConstants(c, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), p);
+            vkCmdDispatch(c, (r2.pixels()+255)/256, 1, 1);
+        });
+    }
 
     printf("\n--- FULL TRANSFORMER BLOCK TESTS (4 blocks each) ---\n\n");
 
@@ -732,6 +840,7 @@ int main() {
     dp(pFFN1); dp(pFFN4); dp(pWin8); dp(pQKV); dp(pAttn); dp(pOutFFN);
     dp(pWin16); dp(pLinKV); dp(pLinRed); dp(pLinQFFN);
     dp(pWinFast); dp(pSplit2A); dp(pSplit2F); dp(pFFNSplit); dp(pFFNcv256); dp(pFFNW1); dp(pFFNW2);
+    dp(pSplitEnc128); dp(pSplitEnc64); dp(pInputConv); dp(pEnc1); dp(pEnc2Orig); dp(pEnc3Orig);
     dp(pProj128to256); dp(pProj256to128); dp(pWinD256); dp(pFusedD256); dp(pFused4); dp(pSharedW);
     vkDestroyPipelineLayout(device, pipeLayout, nullptr);
     vkDestroyDescriptorPool(device, descPool, nullptr);
